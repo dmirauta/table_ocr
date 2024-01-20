@@ -2598,6 +2598,7 @@ dependencies = [
  "egui_plot",
  "image",
  "iter_tools",
+ "rayon",
  "rfd",
 ]
 

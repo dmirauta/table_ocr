@@ -13,6 +13,10 @@ use egui::{
 use egui_inspect::EguiInspect;
 use egui_plot::{Plot, PlotImage, PlotPoint, PlotUi, Polygon};
 use image::{ColorType, ImageResult};
+use iter_tools::Itertools;
+
+use rayon::iter::ParallelBridge;
+use rayon::prelude::*;
 
 thread_local! {
     static SHARED_STATE: RefCell<SharedState> = Default::default();
@@ -221,11 +225,22 @@ impl TableGrid {
         ));
     }
     fn process(&self) -> Vec<Vec<String>> {
-        let mut out = vec![];
+        let mut out = vec![
+            vec![String::new(); self.grid.verticals.len() - 1];
+            self.grid.horizontals.len() - 1
+        ];
 
-        for (i, hw) in self.grid.horizontals.windows(2).rev().enumerate() {
-            let mut row = vec![];
-            for (j, vw) in self.grid.verticals.windows(2).enumerate() {
+        // for (i, hw) in self.grid.horizontals.windows(2).rev().enumerate() {
+        //     for (j, vw) in self.grid.verticals.windows(2).enumerate() {
+        let out_flat: Vec<_> = self
+            .grid
+            .horizontals
+            .windows(2)
+            .rev()
+            .enumerate()
+            .cartesian_product(self.grid.verticals.windows(2).enumerate())
+            .par_bridge()
+            .map(|((i, hw), (j, vw))| {
                 let img_path = format!("/tmp/ocr_crop_{i}_{j}.jpeg");
                 let txt_path = format!("/tmp/ocr_out_{i}_{j}");
 
@@ -248,9 +263,12 @@ impl TableGrid {
                 fs::remove_file(img_path.as_str()).unwrap();
                 fs::remove_file(txt_path.as_str()).unwrap();
 
-                row.push(ocr_out.trim().trim_matches('‘').to_string());
-            }
-            out.push(row);
+                (i, j, ocr_out.trim().trim_matches('‘').to_string())
+            })
+            .collect();
+
+        for (i, j, s) in out_flat {
+            out[i][j] = s;
         }
 
         out
@@ -322,7 +340,7 @@ impl eframe::App for TableGrid {
                     .show_axes(false)
                     .show_grid(false)
                     .allow_drag(drag_enabled)
-                    .view_aspect(1.0)
+                    .view_aspect(texture.aspect_ratio())
                     .data_aspect(1.0 / texture.aspect_ratio())
                     .show(ui, |pui| {
                         if let Some(pointer) = pui.pointer_coordinate() {
