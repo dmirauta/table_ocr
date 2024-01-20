@@ -7,9 +7,10 @@ use std::{
 
 use eframe::NativeOptions;
 use egui::{
-    vec2, CentralPanel, Color32, ColorImage, Context, Slider, Stroke, TextureHandle,
-    TextureOptions, Vec2,
+    vec2, CentralPanel, Color32, ColorImage, Context, ScrollArea, Slider, Stroke, TextureHandle,
+    TextureOptions, Vec2, Window,
 };
+use egui_extras::{Column, TableBuilder};
 use egui_inspect::EguiInspect;
 use egui_plot::{Plot, PlotImage, PlotPoint, PlotUi, Polygon};
 use image::{ColorType, ImageResult};
@@ -165,12 +166,61 @@ struct Extents {
     ymax: f64,
 }
 
+struct TableEdit {
+    items: Vec<Vec<String>>,
+}
+
+impl TableEdit {
+    fn csv(&self) -> String {
+        self.items
+            .iter()
+            .map(|row| row.iter().map(|item| format!("\"{item}\"")).join(", "))
+            .join("\n")
+    }
+}
+
+impl EguiInspect for TableEdit {
+    fn inspect(&self, _label: &str, _ui: &mut egui::Ui) {
+        todo!()
+    }
+
+    fn inspect_mut(&mut self, _label: &str, ui: &mut egui::Ui) {
+        // ui.label(format!("{:?}", &self.items).as_str());
+        ScrollArea::both().show(ui, |ui| {
+            let mut builder = TableBuilder::new(ui);
+            let nrows = self.items.len();
+            let ncols = self.items[0].len();
+
+            for _ in 0..ncols {
+                builder = builder.column(Column::auto().resizable(true));
+            }
+
+            builder.body(|body| {
+                body.rows(30.0, nrows, |mut row| {
+                    let i = row.index();
+                    for j in 0..ncols {
+                        row.col(|ui| {
+                            self.items[i][j].inspect_mut(format!("{i},{j}").as_str(), ui);
+                        });
+                    }
+                });
+            });
+        });
+        if ui.button("Export csv").clicked() {
+            if let Some(path) = rfd::FileDialog::new().set_directory(".").save_file() {
+                fs::write(path, self.csv()).unwrap();
+            }
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct TableGrid {
     image_path: Option<PathBuf>,
     cimage: Option<ColorImage>,
     texture: Option<TextureHandle>,
     grid: Grid,
+    table_edit: Option<TableEdit>,
 }
 
 fn save_img(buff: &[u8], size: [usize; 2], fpath: impl AsRef<Path>) -> ImageResult<()> {
@@ -230,8 +280,6 @@ impl TableGrid {
             self.grid.horizontals.len() - 1
         ];
 
-        // for (i, hw) in self.grid.horizontals.windows(2).rev().enumerate() {
-        //     for (j, vw) in self.grid.verticals.windows(2).enumerate() {
         let out_flat: Vec<_> = self
             .grid
             .horizontals
@@ -300,84 +348,94 @@ impl eframe::App for TableGrid {
 
                 self.update_extents();
 
-                ui.horizontal(|ui| {
-                    SHARED_STATE.with_borrow_mut(|ss| {
-                        ui.label("Separator thickness");
-                        ui.add(Slider::new(&mut ss.delta_x, 0.0001..=0.01).logarithmic(true));
-                        ss.separator_color.inspect_mut("Separator colors", ui);
-                    });
-
-                    if ui.button("Remove horiz").clicked() {
-                        if self.grid.horizontals.len() > 2 {
-                            self.grid.horizontals.remove(0);
-                        }
-                    }
-                    if ui.button("Remove vert").clicked() {
-                        if self.grid.verticals.len() > 2 {
-                            self.grid.verticals.pop();
-                        }
-                    }
-                    if ui.button("Reset grid").clicked() {
-                        self.grid = Default::default();
-                    }
-                    if ui.button("Test save").clicked() {
-                        let tab = self.process();
-                        dbg!(tab);
-                    }
-                });
-
-                let middle_held = ui.input(|r| r.pointer.button_down(egui::PointerButton::Middle));
-                let zooming = ui.input(|r| r.pointer.button_down(egui::PointerButton::Secondary));
-                let (new_horiz, new_vert) = ui.input(|r| {
-                    let sec = r.pointer.button_clicked(egui::PointerButton::Secondary);
-                    let shif = r.modifiers.shift;
-                    (sec && !shif, sec && shif)
-                });
-
-                let texture = self.texture.as_ref().unwrap();
-                let mut drag_enabled = SHARED_STATE.with_borrow(|ss| ss.drag_enabled);
-                Plot::new("plot")
-                    .show_axes(false)
-                    .show_grid(false)
-                    .allow_drag(drag_enabled)
-                    .view_aspect(texture.aspect_ratio())
-                    .data_aspect(1.0 / texture.aspect_ratio())
-                    .show(ui, |pui| {
-                        if let Some(pointer) = pui.pointer_coordinate() {
-                            if new_horiz {
-                                self.grid.horizontals.push(HorizSep { y: pointer.y });
-                            }
-                            if new_vert {
-                                self.grid.verticals.push(VertSep { x: pointer.x });
-                            }
-                        }
-
-                        let plot_img =
-                            PlotImage::new(texture, PlotPoint::new(0.5, 0.5), vec2(1.0, 1.0));
-                        pui.image(plot_img);
-
-                        drag_enabled = !(middle_held || zooming);
-
-                        if middle_held {
-                            // shift all
-                            drag_enabled = false;
-                            let dd = pui.pointer_coordinate_drag_delta();
-                            for v in self.grid.verticals.iter_mut() {
-                                v.translate(dd)
-                            }
-                            for h in self.grid.horizontals.iter_mut() {
-                                h.translate(dd)
-                            }
-                        }
-
+                Window::new("Preview").show(ctx, |ui| {
+                    ui.horizontal(|ui| {
                         SHARED_STATE.with_borrow_mut(|ss| {
-                            ss.drag_enabled = drag_enabled;
-                            ss.delta_y = ss.delta_x * (texture.aspect_ratio() as f64);
+                            ui.label("Separator thickness");
+                            ui.add(Slider::new(&mut ss.delta_x, 0.0001..=0.01).logarithmic(true));
+                            ss.separator_color.inspect_mut("Separator color", ui);
                         });
-                        self.grid.plot_inspect(pui);
+
+                        if ui.button("Remove horiz").clicked() {
+                            if self.grid.horizontals.len() > 2 {
+                                self.grid.horizontals.remove(0);
+                            }
+                        }
+                        if ui.button("Remove vert").clicked() {
+                            if self.grid.verticals.len() > 2 {
+                                self.grid.verticals.pop();
+                            }
+                        }
+                        if ui.button("Reset grid").clicked() {
+                            self.grid = Default::default();
+                        }
                     });
+
+                    let middle_held =
+                        ui.input(|r| r.pointer.button_down(egui::PointerButton::Middle));
+                    let zooming =
+                        ui.input(|r| r.pointer.button_down(egui::PointerButton::Secondary));
+                    let (new_horiz, new_vert) = ui.input(|r| {
+                        let sec = r.pointer.button_clicked(egui::PointerButton::Secondary);
+                        let shif = r.modifiers.shift;
+                        (sec && !shif, sec && shif)
+                    });
+
+                    let texture = self.texture.as_ref().unwrap();
+                    let mut drag_enabled = SHARED_STATE.with_borrow(|ss| ss.drag_enabled);
+
+                    Plot::new("plot")
+                        .show_axes(false)
+                        .show_grid(false)
+                        .allow_drag(drag_enabled)
+                        .view_aspect(texture.aspect_ratio())
+                        .data_aspect(1.0 / texture.aspect_ratio())
+                        .show(ui, |pui| {
+                            if let Some(pointer) = pui.pointer_coordinate() {
+                                if new_horiz {
+                                    self.grid.horizontals.push(HorizSep { y: pointer.y });
+                                }
+                                if new_vert {
+                                    self.grid.verticals.push(VertSep { x: pointer.x });
+                                }
+                            }
+
+                            let plot_img =
+                                PlotImage::new(texture, PlotPoint::new(0.5, 0.5), vec2(1.0, 1.0));
+                            pui.image(plot_img);
+
+                            drag_enabled = !(middle_held || zooming);
+
+                            if middle_held {
+                                // shift all
+                                drag_enabled = false;
+                                let dd = pui.pointer_coordinate_drag_delta();
+                                for v in self.grid.verticals.iter_mut() {
+                                    v.translate(dd)
+                                }
+                                for h in self.grid.horizontals.iter_mut() {
+                                    h.translate(dd)
+                                }
+                            }
+
+                            SHARED_STATE.with_borrow_mut(|ss| {
+                                ss.drag_enabled = drag_enabled;
+                                ss.delta_y = ss.delta_x * (texture.aspect_ratio() as f64);
+                            });
+                            self.grid.plot_inspect(pui);
+                        });
+                    if ui.button("Extract").clicked() {
+                        let items = self.process();
+                        self.table_edit = Some(TableEdit { items })
+                    }
+                });
             } else {
                 ui.label("Must load an image first.");
+            }
+            if self.table_edit.is_some() {
+                Window::new("Table").min_width(500.0).show(ctx, |ui| {
+                    self.table_edit.as_mut().unwrap().inspect_mut("", ui);
+                });
             }
         });
     }
