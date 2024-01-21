@@ -1,6 +1,7 @@
 use std::{
     cell::RefCell,
-    fs,
+    f32::consts::PI,
+    fs, io,
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
@@ -13,7 +14,8 @@ use egui::{
 use egui_extras::{Column, TableBuilder};
 use egui_inspect::EguiInspect;
 use egui_plot::{Plot, PlotImage, PlotPoint, PlotUi, Polygon};
-use image::{ColorType, ImageResult};
+use image::{ColorType, ImageResult, RgbaImage};
+use imageproc::geometric_transformations::{self, rotate_about_center};
 use iter_tools::Itertools;
 
 use rayon::iter::ParallelBridge;
@@ -231,10 +233,55 @@ impl OCROptions {
     }
 }
 
+struct TableImage {
+    base: ColorImage,
+    rotated: ColorImage,
+    theta: f32,
+    theta_old: f32,
+    base_tex: Option<TextureHandle>,
+    rot_tex: Option<TextureHandle>,
+}
+
+impl TableImage {
+    #[allow(dead_code)]
+    fn base_tex(&mut self, ctx: &Context) -> &TextureHandle {
+        self.base_tex.get_or_insert_with(|| {
+            ctx.load_texture("test_img", self.base.clone(), TextureOptions::LINEAR)
+        })
+    }
+    fn rot_tex(&mut self, ctx: &Context) -> &TextureHandle {
+        self.rot_tex.get_or_insert_with(|| {
+            ctx.load_texture("test_img", self.rotated.clone(), TextureOptions::LINEAR)
+        })
+    }
+    fn inspect_rotation(&mut self, ui: &mut egui::Ui) {
+        ui.label("Rotation");
+        ui.add(Slider::new(&mut self.theta, -PI / 16.0..=PI / 16.0));
+        if self.theta != self.theta_old {
+            let base = RgbaImage::from_fn(
+                self.base.width() as u32,
+                self.base.height() as u32,
+                |i, j| {
+                    let color = self.base.pixels[(j as usize) * self.base.width() + (i as usize)];
+                    image::Rgba([color.r(), color.g(), color.b(), color.a()])
+                },
+            );
+            let rotated_image = rotate_about_center(
+                &base,
+                self.theta,
+                geometric_transformations::Interpolation::Bicubic,
+                image::Rgba([255, 0, 0, 0]),
+            );
+            self.rotated = img_to_cim(rotated_image.into());
+            self.theta_old = self.theta;
+            self.rot_tex = None;
+        }
+    }
+}
+
 pub struct TableGrid {
     image_path: Option<PathBuf>,
-    cimage: Option<ColorImage>,
-    texture: Option<TextureHandle>,
+    image: Option<TableImage>,
     grid: Grid,
     table_edit: Option<TableEdit>,
     cmd_template: String,
@@ -244,8 +291,7 @@ impl Default for TableGrid {
     fn default() -> Self {
         Self {
             image_path: Default::default(),
-            cimage: Default::default(),
-            texture: Default::default(),
+            image: Default::default(),
             grid: Default::default(),
             table_edit: Default::default(),
             cmd_template: OCROptions::Tesseract.cmd_template(),
@@ -267,10 +313,17 @@ fn clip(x: f64) -> f64 {
     x.max(0.0).min(1.0)
 }
 
+fn img_to_cim(image: image::DynamicImage) -> ColorImage {
+    let size = [image.width() as _, image.height() as _];
+    let image_buffer = image.to_rgba8();
+    let pixels = image_buffer.as_flat_samples();
+    ColorImage::from_rgba_unmultiplied(size, pixels.as_slice())
+}
+
 impl TableGrid {
     fn crop_buffer(&self, x1: f64, x2: f64, y1: f64, y2: f64) -> (Vec<u8>, [usize; 2]) {
-        let orig_size = self.texture.as_ref().unwrap().size();
-        let cim = self.cimage.as_ref().unwrap();
+        let cim = &self.image.as_ref().unwrap().base;
+        let orig_size = cim.size;
         let i0 = (clip(x1.min(x2)) * (orig_size[0] as f64)) as usize;
         let i1 = (clip(x1.max(x2)) * (orig_size[0] as f64)) as usize;
         let j0 = (clip(1.0 - y1.max(y2)) * (orig_size[1] as f64)) as usize;
@@ -287,21 +340,19 @@ impl TableGrid {
         }
         (out, size)
     }
-    fn try_set_tex(&mut self, ctx: &Context) {
+    fn load_image(&mut self) {
         let img_path = self.image_path.take().unwrap();
-        self.cimage = Some({
-            let image = image::io::Reader::open(img_path).unwrap().decode().unwrap();
-            let size = [image.width() as _, image.height() as _];
-            let image_buffer = image.to_rgba8();
-            let pixels = image_buffer.as_flat_samples();
-            ColorImage::from_rgba_unmultiplied(size, pixels.as_slice())
-        });
+        let image = image::io::Reader::open(img_path).unwrap().decode().unwrap();
+        let cim = img_to_cim(image);
 
-        self.texture = Some(ctx.load_texture(
-            "test_img",
-            self.cimage.as_ref().unwrap().clone(),
-            TextureOptions::LINEAR,
-        ));
+        self.image = Some(TableImage {
+            base: cim.clone(),
+            rotated: cim,
+            theta: 0.0,
+            theta_old: 0.0,
+            base_tex: None,
+            rot_tex: None,
+        });
     }
     fn process(&self) -> Vec<Vec<String>> {
         let mut out = vec![
@@ -309,7 +360,7 @@ impl TableGrid {
             self.grid.horizontals.len() - 1
         ];
 
-        let out_flat: Vec<_> = self
+        let out_flat: Vec<io::Result<_>> = self
             .grid
             .horizontals
             .windows(2)
@@ -341,22 +392,34 @@ impl TableGrid {
                     .args(cmd_iter)
                     .stdout(Stdio::null())
                     .stderr(Stdio::null())
-                    .spawn()
-                    .unwrap();
+                    .spawn()?;
 
-                handle.wait().unwrap();
+                handle.wait()?;
 
                 let txt_path = format!("{txt_path}.txt");
-                let ocr_out = fs::read_to_string(txt_path.as_str()).unwrap();
-                fs::remove_file(img_path.as_str()).unwrap();
-                fs::remove_file(txt_path.as_str()).unwrap();
+                let ocr_out = fs::read_to_string(txt_path.as_str())?;
+                fs::remove_file(img_path.as_str())?;
+                fs::remove_file(txt_path.as_str())?;
 
-                (i, j, ocr_out.trim().trim_matches('‘').to_string())
+                Ok((
+                    i,
+                    j,
+                    ocr_out
+                        .trim()
+                        .trim_matches('‘')
+                        .trim_matches('"')
+                        .to_string(),
+                ))
             })
             .collect();
 
-        for (i, j, s) in out_flat {
-            out[i][j] = s;
+        for res in out_flat {
+            match res {
+                Ok((i, j, s)) => out[i][j] = s,
+                Err(e) => {
+                    dbg!(e);
+                }
+            }
         }
 
         out
@@ -378,9 +441,9 @@ impl eframe::App for TableGrid {
         CentralPanel::default().show(ctx, |ui| {
             if ui.button("Select table image").clicked() {
                 self.image_path = rfd::FileDialog::new().set_directory(".").pick_file();
-                self.try_set_tex(ui.ctx());
+                self.load_image();
             }
-            if self.texture.is_some() {
+            if self.image.is_some() {
                 self.grid.sort_vert();
                 self.grid.sort_horiz();
 
@@ -388,6 +451,8 @@ impl eframe::App for TableGrid {
 
                 Window::new("Preview").show(ctx, |ui| {
                     ui.horizontal(|ui| {
+                        self.image.as_mut().unwrap().inspect_rotation(ui);
+
                         SHARED_STATE.with_borrow_mut(|ss| {
                             ui.label("Separator thickness");
                             ui.add(Slider::new(&mut ss.delta_x, 0.0001..=0.01).logarithmic(true));
@@ -436,7 +501,7 @@ impl eframe::App for TableGrid {
                         (sec && !shif, sec && shif)
                     });
 
-                    let texture = self.texture.as_ref().unwrap();
+                    let texture = self.image.as_mut().unwrap().rot_tex(ui.ctx());
                     let mut drag_enabled = SHARED_STATE.with_borrow(|ss| ss.drag_enabled);
 
                     Plot::new("plot")
@@ -447,11 +512,17 @@ impl eframe::App for TableGrid {
                         .data_aspect(1.0 / texture.aspect_ratio())
                         .show(ui, |pui| {
                             if let Some(pointer) = pui.pointer_coordinate() {
-                                if new_horiz {
-                                    self.grid.horizontals.push(HorizSep { y: pointer.y });
-                                }
-                                if new_vert {
-                                    self.grid.verticals.push(VertSep { x: pointer.x });
+                                if 0.0 < pointer.x
+                                    && pointer.x < 1.0
+                                    && 0.0 < pointer.y
+                                    && pointer.y < 1.0
+                                {
+                                    if new_horiz {
+                                        self.grid.horizontals.push(HorizSep { y: pointer.y });
+                                    }
+                                    if new_vert {
+                                        self.grid.verticals.push(VertSep { x: pointer.x });
+                                    }
                                 }
                             }
 
@@ -483,9 +554,9 @@ impl eframe::App for TableGrid {
             } else {
                 ui.label("Must load an image first.");
             }
-            if self.table_edit.is_some() {
+            if let Some(te) = &mut self.table_edit {
                 Window::new("Table").min_width(500.0).show(ctx, |ui| {
-                    self.table_edit.as_mut().unwrap().inspect_mut("", ui);
+                    te.inspect_mut("", ui);
                 });
             }
         });
