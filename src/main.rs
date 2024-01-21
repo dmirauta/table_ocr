@@ -185,7 +185,6 @@ impl EguiInspect for TableEdit {
     }
 
     fn inspect_mut(&mut self, _label: &str, ui: &mut egui::Ui) {
-        // ui.label(format!("{:?}", &self.items).as_str());
         ScrollArea::both().show(ui, |ui| {
             let mut builder = TableBuilder::new(ui);
             let nrows = self.items.len();
@@ -214,13 +213,44 @@ impl EguiInspect for TableEdit {
     }
 }
 
-#[derive(Default)]
+#[allow(dead_code)]
+#[derive(EguiInspect, PartialEq)]
+enum OCROptions {
+    Tesseract,
+    Cuneiform,
+}
+
+impl OCROptions {
+    fn cmd_template(&self) -> String {
+        match self {
+            OCROptions::Tesseract => "tesseract -l eng %img_in% %txt_out%".to_string(),
+            OCROptions::Cuneiform => {
+                "cuneiform -l eng -f text -o %txt_out%.txt %img_in%".to_string()
+            }
+        }
+    }
+}
+
 pub struct TableGrid {
     image_path: Option<PathBuf>,
     cimage: Option<ColorImage>,
     texture: Option<TextureHandle>,
     grid: Grid,
     table_edit: Option<TableEdit>,
+    cmd_template: String,
+}
+
+impl Default for TableGrid {
+    fn default() -> Self {
+        Self {
+            image_path: Default::default(),
+            cimage: Default::default(),
+            texture: Default::default(),
+            grid: Default::default(),
+            table_edit: Default::default(),
+            cmd_template: OCROptions::Tesseract.cmd_template(),
+        }
+    }
 }
 
 fn save_img(buff: &[u8], size: [usize; 2], fpath: impl AsRef<Path>) -> ImageResult<()> {
@@ -246,7 +276,6 @@ impl TableGrid {
         let j0 = (clip(1.0 - y1.max(y2)) * (orig_size[1] as f64)) as usize;
         let j1 = (clip(1.0 - y1.min(y2)) * (orig_size[1] as f64)) as usize;
         let size = [i1 - i0, j1 - j0];
-        // dbg!(i0, i1, j0, j1, &size);
         let mut out = vec![];
         for j in j0..j1 {
             for i in i0..i1 {
@@ -289,21 +318,32 @@ impl TableGrid {
             .cartesian_product(self.grid.verticals.windows(2).enumerate())
             .par_bridge()
             .map(|((i, hw), (j, vw))| {
-                let img_path = format!("/tmp/ocr_crop_{i}_{j}.jpeg");
+                let img_path = format!("/tmp/ocr_crop_{i}_{j}.png");
                 let txt_path = format!("/tmp/ocr_out_{i}_{j}");
 
                 let (buff, size) = self.crop_buffer(vw[0].x, vw[1].x, hw[0].y, hw[1].y);
                 save_img(buff.as_slice(), size, Path::new(img_path.as_str())).unwrap();
 
-                let mut handle = Command::new("tesseract")
+                let cmd = self
+                    .cmd_template
+                    .as_str()
+                    .replace("%img_in%", img_path.as_str())
+                    .replace("%txt_out%", txt_path.as_str());
+
+                if i == 0 && j == 0 {
+                    dbg!(&cmd);
+                }
+
+                let mut cmd_iter = cmd.split_whitespace();
+
+                let prog = cmd_iter.next().unwrap();
+                let mut handle = Command::new(prog)
+                    .args(cmd_iter)
                     .stdout(Stdio::null())
                     .stderr(Stdio::null())
-                    .arg(img_path.as_str())
-                    .arg(txt_path.as_str())
-                    .arg("-l")
-                    .arg("eng")
                     .spawn()
                     .unwrap();
+
                 handle.wait().unwrap();
 
                 let txt_path = format!("{txt_path}.txt");
@@ -332,8 +372,6 @@ impl TableGrid {
         })
     }
 }
-
-// static IMG: &str = "/home/d/Pictures/table2.png";
 
 impl eframe::App for TableGrid {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
@@ -368,6 +406,23 @@ impl eframe::App for TableGrid {
                         }
                         if ui.button("Reset grid").clicked() {
                             self.grid = Default::default();
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        self.cmd_template.inspect_mut("command", ui);
+                        ui.menu_button("Preset commands", |ui| {
+                            if ui.button("Tessseract").clicked() {
+                                self.cmd_template = OCROptions::Tesseract.cmd_template();
+                                ui.close_menu();
+                            }
+                            if ui.button("Cuneiform").clicked() {
+                                self.cmd_template = OCROptions::Cuneiform.cmd_template();
+                                ui.close_menu();
+                            }
+                        });
+                        if ui.button("Extract").clicked() {
+                            let items = self.process();
+                            self.table_edit = Some(TableEdit { items })
                         }
                     });
 
@@ -424,10 +479,6 @@ impl eframe::App for TableGrid {
                             });
                             self.grid.plot_inspect(pui);
                         });
-                    if ui.button("Extract").clicked() {
-                        let items = self.process();
-                        self.table_edit = Some(TableEdit { items })
-                    }
                 });
             } else {
                 ui.label("Must load an image first.");
