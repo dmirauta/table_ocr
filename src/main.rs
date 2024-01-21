@@ -279,6 +279,23 @@ impl TableImage {
     }
 }
 
+static HELP_STR: &str = "Key bindings for image preview (egui plot).
+
+Left click drag: [on separator] move separator, [off separator] pan preview.
+
+Ctrl + Mouse wheel: zoom.
+
+Mouse wheel drag: translate grid.
+
+Double click left mouse button: reset zoom.
+
+Right click: place new horizontal separator.
+
+Right click + Shift: place new vertical separator.
+
+
+When finished annotating, hit extract to generate table.";
+
 pub struct TableGrid {
     image_path: Option<PathBuf>,
     image: Option<TableImage>,
@@ -449,7 +466,7 @@ impl eframe::App for TableGrid {
 
                 self.update_extents();
 
-                Window::new("Preview").show(ctx, |ui| {
+                Window::new("Annotation").show(ctx, |ui| {
                     ui.horizontal(|ui| {
                         self.image.as_mut().unwrap().inspect_rotation(ui);
 
@@ -489,6 +506,11 @@ impl eframe::App for TableGrid {
                             let items = self.process();
                             self.table_edit = Some(TableEdit { items })
                         }
+                        ui.menu_button("Help", |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(HELP_STR);
+                            })
+                        });
                     });
 
                     let middle_held =
@@ -508,6 +530,7 @@ impl eframe::App for TableGrid {
                         .show_axes(false)
                         .show_grid(false)
                         .allow_drag(drag_enabled)
+                        .allow_boxed_zoom(false)
                         .view_aspect(texture.aspect_ratio())
                         .data_aspect(1.0 / texture.aspect_ratio())
                         .show(ui, |pui| {
