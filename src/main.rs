@@ -339,7 +339,7 @@ fn img_to_cim(image: image::DynamicImage) -> ColorImage {
 
 impl TableGrid {
     fn crop_buffer(&self, x1: f64, x2: f64, y1: f64, y2: f64) -> (Vec<u8>, [usize; 2]) {
-        let cim = &self.image.as_ref().unwrap().base;
+        let cim = &self.image.as_ref().unwrap().rotated;
         let orig_size = cim.size;
         let i0 = (clip(x1.min(x2)) * (orig_size[0] as f64)) as usize;
         let i1 = (clip(x1.max(x2)) * (orig_size[0] as f64)) as usize;
