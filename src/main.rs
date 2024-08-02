@@ -6,13 +6,15 @@ use std::{
     process::{Command, Stdio},
 };
 
-use eframe::NativeOptions;
-use egui::{
-    vec2, CentralPanel, Color32, ColorImage, Context, ScrollArea, Slider, Stroke, TextureHandle,
-    TextureOptions, Vec2, Window,
-};
 use egui_extras::{Column, TableBuilder};
-use egui_inspect::EguiInspect;
+use egui_inspect::{background_task::BackgroundTask, EguiInspect};
+use egui_inspect::{
+    background_task::Task,
+    egui::{
+        self, vec2, CentralPanel, Color32, ColorImage, Context, ScrollArea, Slider, Stroke,
+        TextureHandle, TextureOptions, Vec2, Window,
+    },
+};
 use egui_plot::{Plot, PlotImage, PlotPoint, PlotUi, Polygon};
 use image::{ColorType, ImageResult, RgbaImage};
 use imageproc::geometric_transformations::{self, rotate_about_center};
@@ -45,6 +47,7 @@ impl Default for SharedState {
     }
 }
 
+#[derive(Clone)]
 struct VertSep {
     x: f64,
 }
@@ -82,6 +85,7 @@ impl VertSep {
     }
 }
 
+#[derive(Clone)]
 struct HorizSep {
     y: f64,
 }
@@ -119,6 +123,7 @@ impl HorizSep {
     }
 }
 
+#[derive(Clone)]
 struct Grid {
     horizontals: Vec<HorizSep>,
     verticals: Vec<VertSep>,
@@ -182,36 +187,36 @@ impl TableEdit {
 }
 
 impl EguiInspect for TableEdit {
-    fn inspect(&self, _label: &str, _ui: &mut egui::Ui) {
-        todo!()
-    }
+    fn inspect(&self, _label: &str, _ui: &mut egui::Ui) {}
 
     fn inspect_mut(&mut self, _label: &str, ui: &mut egui::Ui) {
-        ScrollArea::both().show(ui, |ui| {
-            let mut builder = TableBuilder::new(ui);
-            let nrows = self.items.len();
-            let ncols = self.items[0].len();
+        Window::new("Table").min_width(500.0).show(ui.ctx(), |ui| {
+            ScrollArea::both().show(ui, |ui| {
+                let mut builder = TableBuilder::new(ui);
+                let nrows = self.items.len();
+                let ncols = self.items[0].len();
 
-            for _ in 0..ncols {
-                builder = builder.column(Column::auto().resizable(true));
-            }
+                for _ in 0..ncols {
+                    builder = builder.column(Column::auto().resizable(true));
+                }
 
-            builder.body(|body| {
-                body.rows(30.0, nrows, |mut row| {
-                    let i = row.index();
-                    for j in 0..ncols {
-                        row.col(|ui| {
-                            self.items[i][j].inspect_mut(format!("{i},{j}").as_str(), ui);
-                        });
-                    }
+                builder.body(|body| {
+                    body.rows(30.0, nrows, |mut row| {
+                        let i = row.index();
+                        for j in 0..ncols {
+                            row.col(|ui| {
+                                self.items[i][j].inspect_mut(format!("{i},{j}").as_str(), ui);
+                            });
+                        }
+                    });
                 });
             });
-        });
-        if ui.button("Export csv").clicked() {
-            if let Some(path) = rfd::FileDialog::new().set_directory(".").save_file() {
-                fs::write(path, self.csv()).unwrap();
+            if ui.button("Export csv").clicked() {
+                if let Some(path) = rfd::FileDialog::new().set_directory(".").save_file() {
+                    fs::write(path, self.csv()).unwrap();
+                }
             }
-        }
+        });
     }
 }
 
@@ -300,8 +305,8 @@ pub struct TableGrid {
     image_path: Option<PathBuf>,
     image: Option<TableImage>,
     grid: Grid,
-    table_edit: Option<TableEdit>,
     cmd_template: String,
+    process_task: BackgroundTask<BackgroundOCR>,
 }
 
 impl Default for TableGrid {
@@ -310,8 +315,8 @@ impl Default for TableGrid {
             image_path: Default::default(),
             image: Default::default(),
             grid: Default::default(),
-            table_edit: Default::default(),
             cmd_template: OCROptions::Tesseract.cmd_template(),
+            process_task: Default::default(),
         }
     }
 }
@@ -337,29 +342,33 @@ fn img_to_cim(image: image::DynamicImage) -> ColorImage {
     ColorImage::from_rgba_unmultiplied(size, pixels.as_slice())
 }
 
-impl TableGrid {
-    fn crop_buffer(&self, x1: f64, x2: f64, y1: f64, y2: f64) -> (Vec<u8>, [usize; 2]) {
-        let cim = &self.image.as_ref().unwrap().rotated;
-        let orig_size = cim.size;
-        let i0 = (clip(x1.min(x2)) * (orig_size[0] as f64)) as usize;
-        let i1 = (clip(x1.max(x2)) * (orig_size[0] as f64)) as usize;
-        let j0 = (clip(1.0 - y1.max(y2)) * (orig_size[1] as f64)) as usize;
-        let j1 = (clip(1.0 - y1.min(y2)) * (orig_size[1] as f64)) as usize;
-        let size = [i1 - i0, j1 - j0];
-        let mut out = vec![];
-        for j in j0..j1 {
-            for i in i0..i1 {
-                out.push(cim.pixels[j * orig_size[0] + i].r());
-                out.push(cim.pixels[j * orig_size[0] + i].g());
-                out.push(cim.pixels[j * orig_size[0] + i].b());
-                out.push(cim.pixels[j * orig_size[0] + i].a());
-            }
+#[derive(Clone, Copy, EguiInspect, Debug)]
+#[inspect(collapsible)]
+struct CleaningOptions {
+    trim_whitespace: bool,
+    trim_single_quote: bool,
+    trim_double_quote: bool,
+    no_newlines: bool,
+}
+
+impl Default for CleaningOptions {
+    fn default() -> Self {
+        Self {
+            trim_whitespace: true,
+            trim_single_quote: true,
+            trim_double_quote: true,
+            no_newlines: true,
         }
-        (out, size)
     }
+}
+
+impl TableGrid {
     fn load_image(&mut self) {
         let img_path = self.image_path.take().unwrap();
-        let image = image::io::Reader::open(img_path).unwrap().decode().unwrap();
+        let image = image::ImageReader::open(img_path)
+            .unwrap()
+            .decode()
+            .unwrap();
         let cim = img_to_cim(image);
 
         self.image = Some(TableImage {
@@ -370,76 +379,6 @@ impl TableGrid {
             base_tex: None,
             rot_tex: None,
         });
-    }
-    fn process(&self) -> Vec<Vec<String>> {
-        let mut out = vec![
-            vec![String::new(); self.grid.verticals.len() - 1];
-            self.grid.horizontals.len() - 1
-        ];
-
-        let out_flat: Vec<io::Result<_>> = self
-            .grid
-            .horizontals
-            .windows(2)
-            .rev()
-            .enumerate()
-            .cartesian_product(self.grid.verticals.windows(2).enumerate())
-            .par_bridge()
-            .map(|((i, hw), (j, vw))| {
-                let img_path = format!("/tmp/ocr_crop_{i}_{j}.png");
-                let txt_path = format!("/tmp/ocr_out_{i}_{j}");
-
-                let (buff, size) = self.crop_buffer(vw[0].x, vw[1].x, hw[0].y, hw[1].y);
-                save_img(buff.as_slice(), size, Path::new(img_path.as_str())).unwrap();
-
-                let cmd = self
-                    .cmd_template
-                    .as_str()
-                    .replace("%img_in%", img_path.as_str())
-                    .replace("%txt_out%", txt_path.as_str());
-
-                if i == 0 && j == 0 {
-                    dbg!(&cmd);
-                }
-
-                let mut cmd_iter = cmd.split_whitespace();
-
-                let prog = cmd_iter.next().unwrap();
-                let mut handle = Command::new(prog)
-                    .args(cmd_iter)
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .spawn()?;
-
-                handle.wait()?;
-
-                let txt_path = format!("{txt_path}.txt");
-                let ocr_out = fs::read_to_string(txt_path.as_str())?;
-                fs::remove_file(img_path.as_str())?;
-                fs::remove_file(txt_path.as_str())?;
-
-                Ok((
-                    i,
-                    j,
-                    ocr_out
-                        .trim()
-                        .trim_matches('‘')
-                        .trim_matches('"')
-                        .to_string(),
-                ))
-            })
-            .collect();
-
-        for res in out_flat {
-            match res {
-                Ok((i, j, s)) => out[i][j] = s,
-                Err(e) => {
-                    dbg!(e);
-                }
-            }
-        }
-
-        out
     }
     fn update_extents(&self) {
         SHARED_STATE.with_borrow_mut(|ss| {
@@ -453,8 +392,125 @@ impl TableGrid {
     }
 }
 
-impl eframe::App for TableGrid {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+fn crop_buffer(cim: &ColorImage, x1: f64, x2: f64, y1: f64, y2: f64) -> (Vec<u8>, [usize; 2]) {
+    let orig_size = cim.size;
+    let i0 = (clip(x1.min(x2)) * (orig_size[0] as f64)) as usize;
+    let i1 = (clip(x1.max(x2)) * (orig_size[0] as f64)) as usize;
+    let j0 = (clip(1.0 - y1.max(y2)) * (orig_size[1] as f64)) as usize;
+    let j1 = (clip(1.0 - y1.min(y2)) * (orig_size[1] as f64)) as usize;
+    let size = [i1 - i0, j1 - j0];
+    let mut out = vec![];
+    for j in j0..j1 {
+        for i in i0..i1 {
+            out.push(cim.pixels[j * orig_size[0] + i].r());
+            out.push(cim.pixels[j * orig_size[0] + i].g());
+            out.push(cim.pixels[j * orig_size[0] + i].b());
+            out.push(cim.pixels[j * orig_size[0] + i].a());
+        }
+    }
+    (out, size)
+}
+
+#[derive(EguiInspect, Default)]
+struct BackgroundOCR {
+    #[inspect(hide)]
+    grid: Grid,
+    #[inspect(hide)]
+    cim: ColorImage,
+    #[inspect(hide)]
+    cmd_template: String,
+    #[inspect(hide)]
+    ready: bool,
+    #[inspect(hide)]
+    n_tasks: usize,
+    cleaning_options: CleaningOptions,
+}
+
+impl Task for BackgroundOCR {
+    type Return = TableEdit;
+
+    fn exec_with_expected_steps(&self) -> Option<usize> {
+        self.ready.then_some(self.n_tasks)
+    }
+
+    fn on_exec(&mut self, progress: egui_inspect::background_task::Progress) -> Self::Return {
+        let mut items = vec![
+            vec![String::new(); self.grid.verticals.len() - 1];
+            self.grid.horizontals.len() - 1
+        ];
+        let co = self.cleaning_options;
+
+        let out_flat: Vec<io::Result<_>> = self
+            .grid
+            .horizontals
+            .windows(2)
+            .rev()
+            .enumerate()
+            .cartesian_product(self.grid.verticals.windows(2).enumerate())
+            .par_bridge()
+            .map(|((i, hw), (j, vw))| {
+                let img_path = format!("/tmp/ocr_crop_{i}_{j}.png");
+                let txt_path = format!("/tmp/ocr_out_{i}_{j}");
+
+                let (buff, size) = crop_buffer(&self.cim, vw[0].x, vw[1].x, hw[0].y, hw[1].y);
+                save_img(buff.as_slice(), size, Path::new(img_path.as_str())).unwrap();
+
+                let cmd = self
+                    .cmd_template
+                    .as_str()
+                    .replace("%img_in%", img_path.as_str())
+                    .replace("%txt_out%", txt_path.as_str());
+
+                let mut cmd_iter = cmd.split_whitespace();
+
+                let prog = cmd_iter.next().unwrap();
+                let mut handle = Command::new(prog)
+                    .args(cmd_iter)
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()?;
+
+                handle.wait()?;
+
+                let txt_path = format!("{txt_path}.txt");
+                let mut ocr_out = fs::read_to_string(txt_path.as_str())?;
+                fs::remove_file(img_path.as_str())?;
+                fs::remove_file(txt_path.as_str())?;
+
+                if co.trim_whitespace {
+                    ocr_out = ocr_out.trim().to_string();
+                }
+                if co.trim_single_quote {
+                    ocr_out = ocr_out.trim_matches('\'').trim_matches('‘').to_string();
+                }
+                if co.trim_double_quote {
+                    ocr_out = ocr_out.trim_matches('"').to_string();
+                }
+                if co.no_newlines {
+                    ocr_out = ocr_out.replace('\n', "").to_string();
+                }
+
+                progress.increment();
+
+                Ok((i, j, ocr_out))
+            })
+            .collect();
+
+        for res in out_flat {
+            match res {
+                Ok((i, j, s)) => items[i][j] = s,
+                Err(e) => {
+                    dbg!(e);
+                }
+            }
+        }
+
+        TableEdit { items }
+    }
+}
+
+impl egui_inspect::eframe::App for TableGrid {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut egui_inspect::eframe::Frame) {
         CentralPanel::default().show(ctx, |ui| {
             if ui.button("Select table image").clicked() {
                 self.image_path = rfd::FileDialog::new().set_directory(".").pick_file();
@@ -468,6 +524,12 @@ impl eframe::App for TableGrid {
 
                 Window::new("Annotation").show(ctx, |ui| {
                     ui.horizontal(|ui| {
+                        ui.menu_button("Help", |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(HELP_STR);
+                            })
+                        });
+
                         self.image.as_mut().unwrap().inspect_rotation(ui);
 
                         SHARED_STATE.with_borrow_mut(|ss| {
@@ -502,16 +564,34 @@ impl eframe::App for TableGrid {
                                 ui.close_menu();
                             }
                         });
-                        if ui.button("Extract").clicked() {
-                            let items = self.process();
-                            self.table_edit = Some(TableEdit { items })
-                        }
-                        ui.menu_button("Help", |ui| {
-                            ui.horizontal(|ui| {
-                                ui.label(HELP_STR);
-                            })
-                        });
                     });
+
+                    self.process_task.inspect_mut("", ui);
+                    let ongoing = match &self.process_task {
+                        BackgroundTask::Ongoing { .. } => true,
+                        _ => false,
+                    };
+                    if !ongoing {
+                        if ui.button("Extract").clicked() {
+                            if let BackgroundTask::Starting { task }
+                            | BackgroundTask::Finished { task, .. } = &mut self.process_task
+                            {
+                                task.grid = self.grid.clone();
+                                task.cim = self.image.as_ref().unwrap().rotated.clone();
+                                task.cmd_template = self.cmd_template.clone();
+                                task.n_tasks = (self.grid.horizontals.len() - 1)
+                                    * (self.grid.verticals.len() - 1);
+                                task.ready = true;
+                            }
+                        }
+                    }
+
+                    if let BackgroundTask::Finished {
+                        result: Ok(table), ..
+                    } = &mut self.process_task
+                    {
+                        table.inspect_mut("", ui);
+                    }
 
                     let middle_held =
                         ui.input(|r| r.pointer.button_down(egui::PointerButton::Middle));
@@ -577,19 +657,14 @@ impl eframe::App for TableGrid {
             } else {
                 ui.label("Must load an image first.");
             }
-            if let Some(te) = &mut self.table_edit {
-                Window::new("Table").min_width(500.0).show(ctx, |ui| {
-                    te.inspect_mut("", ui);
-                });
-            }
         });
     }
 }
 
-fn main() -> eframe::Result<()> {
-    eframe::run_native(
+fn main() -> egui_inspect::eframe::Result<()> {
+    egui_inspect::eframe::run_native(
         "Table OCR",
-        NativeOptions::default(),
-        Box::new(|_cc| Box::new(TableGrid::default())),
+        Default::default(),
+        Box::new(|_cc| Ok(Box::new(TableGrid::default()))),
     )
 }
